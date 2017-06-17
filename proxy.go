@@ -214,6 +214,10 @@ func route(w http.ResponseWriter, r *http.Request) {
 loop:
 	for h, i := hosts.choose(); ; h, i = hosts.choose() {
 		count++
+                if !check(h, browser){
+                        //log.Printf("[DEBUG] failed for %s %d %s", h.Name, h.Port, browser)
+                        continue
+                }
 		if h == nil {
 			break loop
 		}
