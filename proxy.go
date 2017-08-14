@@ -27,13 +27,15 @@ const (
 )
 
 const (
-	pingPath  string = "/ping"
-	errPath   string = "/err"
-	routePath string = "/wd/hub/session"
-	proxyPath string = routePath + "/"
-	head      int    = len(proxyPath)
-	tail      int    = head + 32
-	sessPart  int    = 4 // /wd/hub/session/{various length session}
+	pingPath     string = "/ping"
+	errPath      string = "/err"
+	hostPath     string = "/host/"
+	routePath    string = "/wd/hub/session"
+	proxyPath    string = routePath + "/"
+	head         int    = len(proxyPath)
+	md5SumLength int    = 32
+	tail         int    = head + md5SumLength
+	sessPart     int    = 4 // /wd/hub/session/{various length session}
 )
 
 var (
@@ -94,6 +96,9 @@ func (h *Host) session(ctx context.Context, header http.Header, c caps) (map[str
 			req.Header.Add(key, value)
 		}
 	}
+	if h.Username != "" && h.Password != "" {
+		req.SetBasicAuth(h.Username, h.Password)
+	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req = req.WithContext(ctx)
@@ -112,7 +117,7 @@ func (h *Host) session(ctx context.Context, header http.Header, c caps) (map[str
 			return nil, seleniumError
 		}
 		fragments := strings.Split(l.Path, "/")
-		return map[string]interface{}{"sessionId": fragments[len(fragments)-1]}, browserStarted
+		return map[string]interface{}{"sessionId": fragments[len(fragments)-1], "status": 0, "value": struct{}{}}, browserStarted
 	}
 	var reply map[string]interface{}
 	err = json.NewDecoder(resp.Body).Decode(&reply)
@@ -140,7 +145,11 @@ func serial() uint64 {
 }
 
 func info(r *http.Request) (user, remote string) {
-	user = "unknown"
+	if guestAccessAllowed {
+		user = guestUserName
+	} else {
+		user = "unknown"
+	}
 	if u, _, ok := r.BasicAuth(); ok {
 		user = u
 	}
@@ -206,11 +215,13 @@ func route(w http.ResponseWriter, r *http.Request) {
 	excludedHosts := newSet()
 	hosts, version, excludedRegions := browsers.find(browser, version, excludedHosts, newSet())
 	confLock.RUnlock()
+
 	if len(hosts) == 0 {
 		reply(w, errMsg(fmt.Sprintf("unsupported browser: %s", fmtBrowser(browser, version))), http.StatusNotFound)
 		log.Printf("[%d] [UNSUPPORTED_BROWSER] [%s] [%s] [%s]\n", id, user, remote, fmtBrowser(browser, version))
 		return
 	}
+	lastHostError := ""
 loop:
 	for h, i := hosts.choose(); ; h, i = hosts.choose() {
 		count++
@@ -243,7 +254,7 @@ loop:
 					protocolError()
 					return
 				}
-				sess, ok := value.(map[string]interface{})["sessionId"].(string)
+				sess, ok = value.(map[string]interface{})["sessionId"].(string)
 				if !ok {
 					protocolError()
 					return
@@ -262,12 +273,18 @@ loop:
 			excludedRegions.add(h.region)
 			hosts, version, excludedRegions = browsers.find(browser, version, excludedHosts, excludedRegions)
 		}
-		log.Printf("[%d] [SESSION_FAILED] [%s] [%s] [%s] [%s] %s\n", id, user, remote, fmtBrowser(browser, version), h.net(), browserErrMsg(resp))
+		errMsg := browserErrMsg(resp)
+		log.Printf("[%d] [SESSION_FAILED] [%s] [%s] [%s] [%s] %s\n", id, user, remote, fmtBrowser(browser, version), h.net(), errMsg)
+		lastHostError = errMsg
 		if len(hosts) == 0 {
 			break loop
 		}
 	}
-	reply(w, errMsg(fmt.Sprintf("cannot create session %s on any hosts after %d attempt(s)", fmtBrowser(browser, version), count)), http.StatusInternalServerError)
+	notCreatedMsg := fmt.Sprintf("cannot create session %s on any hosts after %d attempt(s)", fmtBrowser(browser, version), count)
+	if len(lastHostError) > 0 {
+		notCreatedMsg = fmt.Sprintf("%s, last host error was: %s", notCreatedMsg, lastHostError)
+	}
+	reply(w, errMsg(notCreatedMsg), http.StatusInternalServerError)
 	log.Printf("[%d] [SESSION_NOT_CREATED] [%s] [%s] [%s]\n", id, user, remote, fmtBrowser(browser, version))
 }
 
@@ -321,6 +338,27 @@ func ping(w http.ResponseWriter, _ *http.Request) {
 
 func err(w http.ResponseWriter, _ *http.Request) {
 	reply(w, errMsg("route not found"), http.StatusNotFound)
+}
+
+func host(w http.ResponseWriter, r *http.Request) {
+	confLock.RLock()
+	defer confLock.RUnlock()
+	head := len(hostPath)
+	tail := head + md5SumLength
+	path := r.URL.Path
+	if len(path) < tail {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("invalid session ID"))
+		return
+	}
+	sum := path[head:tail]
+	h, ok := routes[sum]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte("unknown host"))
+		return
+	}
+	json.NewEncoder(w).Encode(Host{Name: h.Name, Port: h.Port, Count: h.Count})
 }
 
 func postOnly(handler http.HandlerFunc) http.HandlerFunc {
@@ -379,6 +417,28 @@ func requireBasicAuth(authenticator *auth.BasicAuth, handler func(http.ResponseW
 	})
 }
 
+func WithSuitableAuthentication(authenticator *auth.BasicAuth, handler func(http.ResponseWriter, *http.Request)) func(http.ResponseWriter, *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !guestAccessAllowed {
+			//All requests require authentication
+			requireBasicAuth(authenticator, handler)(w, r)
+		} else if _, _, basicAuthPresent := r.BasicAuth(); !basicAuthPresent {
+			//Run the handler as unauthenticated user
+			confLock.RLock()
+			_, ok := quota[guestUserName]
+			confLock.RUnlock()
+			if !ok {
+				reply(w, errMsg("Guest access is unavailable."), http.StatusUnauthorized)
+			} else {
+				handler(w, r)
+			}
+		} else {
+			//Run the handler using basic authentication
+			requireBasicAuth(authenticator, handler)(w, r)
+		}
+	}
+}
+
 func mux() http.Handler {
 	mux := http.NewServeMux()
 	authenticator := auth.NewBasicAuthenticator(
@@ -387,7 +447,8 @@ func mux() http.Handler {
 	)
 	mux.HandleFunc(pingPath, ping)
 	mux.HandleFunc(errPath, err)
-	mux.HandleFunc(routePath, withCloseNotifier(requireBasicAuth(authenticator, postOnly(route))))
+	mux.HandleFunc(hostPath, WithSuitableAuthentication(authenticator, host))
+	mux.HandleFunc(routePath, withCloseNotifier(WithSuitableAuthentication(authenticator, postOnly(route))))
 	mux.Handle(proxyPath, &httputil.ReverseProxy{Director: proxy})
 	return mux
 }

@@ -16,11 +16,13 @@ import (
 )
 
 var (
-	listen         string
-	quotaDir       string
-	users          string
-	timeout        time.Duration
-	gracefulPeriod time.Duration
+	listen             string
+	quotaDir           string
+	users              string
+	timeout            time.Duration
+	gracefulPeriod     time.Duration
+	guestAccessAllowed bool
+	guestUserName      string
 
 	startTime      = time.Now()
 	lastReloadTime = time.Now()
@@ -77,6 +79,8 @@ func fileExists(p string) bool {
 }
 
 func init() {
+	flag.BoolVar(&guestAccessAllowed, "guests-allowed", false, "Allow guest (unauthenticated) users to access the grid")
+	flag.StringVar(&guestUserName, "guests-quota", "guest", "Which quota file to use for guests")
 	flag.StringVar(&listen, "listen", ":4444", "host and port to listen to")
 	flag.StringVar(&quotaDir, "quotaDir", "quota", "quota directory")
 	flag.StringVar(&users, "users", ".htpasswd", "htpasswd auth file path")
@@ -113,11 +117,15 @@ func main() {
 		Addr:    listen,
 		Handler: mux(),
 	}
+	e := make(chan error)
 	go func() {
-		log.Fatal(server.ListenAndServe())
+		e <- server.ListenAndServe()
 	}()
-
-	<-stop
+	select {
+	case err := <-e:
+		log.Fatal(err)
+	case <-stop:
+	}
 
 	log.Printf("[SHUTTING_DOWN] [%s]\n", gracefulPeriod)
 	ctx, cancel := context.WithTimeout(context.Background(), gracefulPeriod)
