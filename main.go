@@ -23,6 +23,7 @@ var (
 	gracefulPeriod     time.Duration
 	guestAccessAllowed bool
 	guestUserName      string
+	verbose            bool
 
 	startTime      = time.Now()
 	lastReloadTime = time.Now()
@@ -57,7 +58,9 @@ func loadQuotaFile(file string) {
 		return
 	}
 	updateQuota(quotaName, browsers)
-	log.Printf("Loaded configuration from [%s]:\n%v\n", file, browsers)
+	if verbose {
+		log.Printf("Loaded configuration from [%s]:\n%v\n", file, browsers)
+	}
 }
 
 func updateQuota(quotaName string, browsers Browsers) {
@@ -87,6 +90,7 @@ func init() {
 	flag.DurationVar(&timeout, "timeout", 300*time.Second, "session creation timeout in time.Duration format, e.g. 300s or 500ms")
 	flag.DurationVar(&gracefulPeriod, "graceful-period", 300*time.Second, "graceful shutdown period in time.Duration format, e.g. 300s or 500ms")
 	flag.BoolVar(&version, "version", false, "show version and exit")
+	flag.BoolVar(&verbose, "verbose", false, "enable verbose mode")
 	flag.Parse()
 	if version {
 		showVersion()

@@ -9,6 +9,10 @@ import (
 	. "github.com/aandryashin/matchers"
 )
 
+func init() {
+	verbose = true
+}
+
 func TestEmptyListOfHosts(t *testing.T) {
 	host, index := Hosts{}.choose()
 	AssertThat(t, host, Is{(*Host)(nil)})
