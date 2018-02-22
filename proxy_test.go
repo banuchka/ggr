@@ -74,6 +74,8 @@ func hostportnum(u string) (string, int) {
 func init() {
 	srv = httptest.NewServer(mux())
 	listen = hostport(srv.URL)
+	gitRevision = "test-revision"
+	verbose = true
 }
 
 func gridrouter(p string) string {
@@ -98,6 +100,9 @@ func TestPing(t *testing.T) {
 	AssertThat(t, hasLastReloadTime, Is{true})
 	_, hasNumRequests := data["numRequests"]
 	AssertThat(t, hasNumRequests, Is{true})
+	version, hasVersion := data["version"]
+	AssertThat(t, hasVersion, Is{true})
+	AssertThat(t, version, EqualTo{"test-revision"})
 }
 
 func TestErr(t *testing.T) {
@@ -129,7 +134,7 @@ func TestGetHostBadSessionId(t *testing.T) {
 	testGetHost(t, "bad-session-id", http.StatusBadRequest)
 }
 
-func testGetHost(t *testing.T, sessionId string, statusCode int) *Host {
+func testGetHost(t *testing.T, sessionID string, statusCode int) *Host {
 
 	test.Lock()
 	defer test.Unlock()
@@ -144,7 +149,7 @@ func testGetHost(t *testing.T, sessionId string, statusCode int) *Host {
 		}}}}
 	updateQuota(user, browsers)
 
-	rsp, err := doBasicHTTPRequest(http.MethodPost, gridrouter(fmt.Sprintf("/host/%s", sessionId)), nil)
+	rsp, err := doBasicHTTPRequest(http.MethodPost, gridrouter(fmt.Sprintf("/host/%s", sessionID)), nil)
 	AssertThat(t, err, Is{nil})
 	AssertThat(t, rsp, Code{statusCode})
 	if statusCode != http.StatusOK {
@@ -155,13 +160,43 @@ func testGetHost(t *testing.T, sessionId string, statusCode int) *Host {
 	return &host
 }
 
+func TestGetQuotaInfoUnauthorized(t *testing.T) {
+	rsp, err := http.Get(gridrouter("/quota"))
+	AssertThat(t, err, Is{nil})
+	AssertThat(t, rsp, Code{http.StatusUnauthorized})
+}
+
+func TestGetQuotaInfo(t *testing.T) {
+	test.Lock()
+	defer test.Unlock()
+
+	browsers := Browsers{Browsers: []Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
+			{Number: "1.0", Regions: []Region{
+				{Hosts: Hosts{
+					Host{Name: "example.com", Port: 4444, Count: 1, Username: "test", Password: "test"},
+				}},
+			}},
+		}}}}
+	updateQuota(user, browsers)
+
+	rsp, err := doBasicHTTPRequest(http.MethodPost, gridrouter("/quota"), nil)
+	AssertThat(t, err, Is{nil})
+	AssertThat(t, rsp, Code{http.StatusOK})
+
+	var fetchedBrowsers []Browser
+	err = json.NewDecoder(rsp.Body).Decode(&fetchedBrowsers)
+	AssertThat(t, err, Is{nil})
+	AssertThat(t, fetchedBrowsers, EqualTo{browsers.Browsers})
+}
+
 func TestProxyScreenVNCProtocol(t *testing.T) {
 
 	test.Lock()
 	defer test.Unlock()
 
 	const testData = "vnc-data"
-	server := testTcpServer(testData)
+	server := testTCPServer(testData)
 	defer server.Close()
 
 	vncHost := Host{Name: "example.com", Port: 4444, Count: 1, VNC: fmt.Sprintf("vnc://%s", server.Addr().String())}
@@ -180,10 +215,10 @@ func TestProxyScreenVNCProtocol(t *testing.T) {
 }
 
 func testDataReceived(host Host, correctData string, t *testing.T) {
-	sessionId := host.sum() + "123"
+	sessionID := host.sum() + "123"
 
 	origin := "http://localhost/"
-	u := fmt.Sprintf("ws://%s/vnc/%s", srv.Listener.Addr(), sessionId)
+	u := fmt.Sprintf("ws://%s/vnc/%s", srv.Listener.Addr(), sessionID)
 	ws, err := websocket.Dial(u, "", origin)
 	AssertThat(t, err, Is{nil})
 
@@ -193,7 +228,7 @@ func testDataReceived(host Host, correctData string, t *testing.T) {
 	AssertThat(t, strings.TrimSpace(string(data)), EqualTo{correctData})
 }
 
-func testTcpServer(data string) net.Listener {
+func testTCPServer(data string) net.Listener {
 	l, _ := net.Listen("tcp", "127.0.0.1:0")
 	go func() {
 		for {
@@ -237,6 +272,54 @@ func TestProxyScreenWebSocketsProtocol(t *testing.T) {
 
 	testDataReceived(wsHost, testData, t)
 
+}
+
+func TestProxyVideoFileWithoutAuth(t *testing.T) {
+	rsp, err := http.Get(gridrouter("/video/123.mp4"))
+
+	AssertThat(t, err, Is{nil})
+	AssertThat(t, rsp, Code{http.StatusUnauthorized})
+}
+
+func TestProxyVideoFile(t *testing.T) {
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/video/123.mp4", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	fileServer := httptest.NewServer(mux)
+	defer fileServer.Close()
+
+	host, port := hostportnum(fileServer.URL)
+	node := Host{Name: host, Port: port, Count: 1}
+
+	test.Lock()
+	defer test.Unlock()
+
+	browsers := Browsers{Browsers: []Browser{
+		{Name: "browser", DefaultVersion: "1.0", Versions: []Version{
+			{Number: "1.0", Regions: []Region{
+				{Hosts: Hosts{
+					node,
+				}},
+			}},
+		}}}}
+	updateQuota(user, browsers)
+
+	sessionID := node.sum() + "123"
+
+	rsp, err := doBasicHTTPRequest(http.MethodGet, gridrouter(fmt.Sprintf("/video/%s", sessionID)), nil)
+	AssertThat(t, err, Is{nil})
+	AssertThat(t, rsp, Code{http.StatusOK})
+
+	rsp, err = doBasicHTTPRequest(http.MethodGet, gridrouter("/video/missing-file"), nil)
+	AssertThat(t, err, Is{nil})
+	AssertThat(t, rsp, Code{http.StatusNotFound})
+
+	rsp, err = doBasicHTTPRequest(http.MethodGet, gridrouter("/video/f7fd94f75c79c36e547c091632da440f_missing-file"), nil)
+	AssertThat(t, err, Is{nil})
+	AssertThat(t, rsp, Code{http.StatusNotFound})
 }
 
 func TestCreateSessionGet(t *testing.T) {
@@ -387,11 +470,18 @@ func TestStartSession(t *testing.T) {
 						node,
 					}},
 				}},
+			}},
+			{Name: "someDevice", DefaultVersion: "2.0", Versions: []Version{
+				{Number: "2.0", Regions: []Region{
+					{Hosts: Hosts{
+						node,
+					}},
+				}},
 			}}}}
 	}
 
 	testStartSession(t, mux, browsersProvider, "browser", "1.0")
-
+	testStartSessionCustomCaps(t, mux, browsersProvider, `{"desiredCapabilities":{"deviceName":"someDevice", "version":"2.0"}}`)
 }
 
 func TestStartSessionWithLocationHeader(t *testing.T) {
@@ -414,7 +504,7 @@ func TestStartSessionWithLocationHeader(t *testing.T) {
 	testStartSession(t, mux, browsersProvider, "browser", "1.0")
 }
 
-func testStartSession(t *testing.T, mux *http.ServeMux, browsersProvider func(Host) Browsers, browserName string, version string) {
+func testStartSessionCustomCaps(t *testing.T, mux *http.ServeMux, browsersProvider func(Host) Browsers, capsJSON string) {
 	selenium := httptest.NewServer(mux)
 	defer selenium.Close()
 
@@ -431,12 +521,16 @@ func testStartSession(t *testing.T, mux *http.ServeMux, browsersProvider func(Ho
 		updateQuota(user, browsers)
 	}()
 
-	rsp, err := createSession(fmt.Sprintf(`{"desiredCapabilities":{"browserName":"%s", "version":"%s"}}`, browserName, version))
+	rsp, err := createSession(capsJSON)
 
 	AssertThat(t, err, Is{nil})
 	var sess map[string]interface{}
 	AssertThat(t, rsp, AllOf{Code{http.StatusOK}, IsJson{&sess}})
 	AssertThat(t, sess["sessionId"], EqualTo{fmt.Sprintf("%s123", node.sum())})
+}
+
+func testStartSession(t *testing.T, mux *http.ServeMux, browsersProvider func(Host) Browsers, browserName string, version string) {
+	testStartSessionCustomCaps(t, mux, browsersProvider, fmt.Sprintf(`{"desiredCapabilities":{"browserName":"%s", "version":"%s"}}`, browserName, version))
 }
 
 func TestStartSessionWithJsonSpecChars(t *testing.T) {
